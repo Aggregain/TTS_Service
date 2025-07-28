@@ -5,7 +5,7 @@ import base64
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from transformers import AutoProcessor, VitsModel
-from ruaccent import RuAccent
+from ruaccent.ruaccent import RuAccent
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using device: {DEVICE}")
