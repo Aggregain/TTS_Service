@@ -7,6 +7,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from transformers import AutoProcessor, VitsModel
 import ruaccent
+from huggingface_hub import snapshot_download # <-- Import the downloader
 
 # --- 1. Configuration and Model Loading ---
 
@@ -14,39 +15,37 @@ import ruaccent
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using device: {DEVICE}")
 
-# Define model details from Hugging Face
-MODEL_ID = "Misha24-10/F5-TTS_RUSSIAN"
+# Define model details
+REPO_ID = "Misha24-10/F5-TTS_RUSSIAN"
 MODEL_SUBFOLDER = "F5TTS_v1_Base_v2"
 SAMPLING_RATE = 48000
 
-# Load the F5-TTS model and processor
-print(f"Loading TTS model: {MODEL_ID}/{MODEL_SUBFOLDER}...")
-processor = None
-model = None
+# --- Download the specific model subfolder ---
+print(f"Downloading model files from subfolder: {MODEL_SUBFOLDER}...")
 try:
-    # Added trust_remote_code=True to allow loading of custom model architecture
-    processor = AutoProcessor.from_pretrained(
-        MODEL_ID,
-        subfolder=MODEL_SUBFOLDER,
-        trust_remote_code=True
+    # This function downloads only the necessary files into a local cache
+    # and returns the path to that directory.
+    local_model_path = snapshot_download(
+        repo_id=REPO_ID,
+        allow_patterns=f"{MODEL_SUBFOLDER}/**" # Pattern to grab all files in the subfolder
     )
-    model = VitsModel.from_pretrained(
-        MODEL_ID,
-        subfolder=MODEL_SUBFOLDER,
-        trust_remote_code=True
-    ).to(DEVICE)
+    print(f"✅ Model files downloaded to: {local_model_path}")
+
+    # --- Load the model from the local path ---
+    print("Loading model from local path...")
+    processor = AutoProcessor.from_pretrained(local_model_path, trust_remote_code=True)
+    model = VitsModel.from_pretrained(local_model_path, trust_remote_code=True).to(DEVICE)
     print("✅ TTS model and processor loaded successfully.")
+
 except Exception as e:
-    print(f"❌ Error loading TTS model: {e}")
+    print(f"❌ An error occurred during model loading: {e}")
+    processor = None
+    model = None
 
 
 # --- 2. Helper Function for Stress Format Conversion ---
 
 def convert_ruaccent_to_plus(text_with_apostrophe: str) -> str:
-    """
-    Converts text stressed with an apostrophe (e.g., "приве'т") to
-    text stressed with a plus sign before the vowel (e.g., "прив+ет").
-    """
     vowels = "аеёиоуыэюяАЕЁИОУЫЭЮЯ"
     words = text_with_apostrophe.split(' ')
     processed_words = []
