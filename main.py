@@ -1,50 +1,83 @@
 # main.py
+import os
 import torch
 import soundfile as sf
 import io
 import base64
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from transformers import AutoProcessor, VitsModel
 import ruaccent
-from huggingface_hub import snapshot_download # <-- Import the downloader
+from huggingface_hub import hf_hub_download
+
+# --- IMPORTANT: Add f5-tts to Python's path ---
+# This allows us to import the custom model code
+import sys
+sys.path.append(os.path.join(os.path.dirname(__file__), 'f5-tts'))
+
+# --- Now, import from the f5-tts repository ---
+from text import text_to_sequence
+from models import SynthesizerTrn
+import commons
+import utils
 
 # --- 1. Configuration and Model Loading ---
 
-# Check for CUDA availability for faster inference
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using device: {DEVICE}")
 
-# Define model details
+# --- Download model files from the Hugging Face Hub ---
+print("Downloading model files...")
 REPO_ID = "Misha24-10/F5-TTS_RUSSIAN"
-MODEL_SUBFOLDER = "F5TTS_v1_Base_v2"
-SAMPLING_RATE = 48000
-
-# --- Download the specific model subfolder ---
-print(f"Downloading model files from subfolder: {MODEL_SUBFOLDER}...")
 try:
-    # This function downloads only the necessary files into a local cache
-    # and returns the path to that directory.
-    local_model_path = snapshot_download(
-        repo_id=REPO_ID,
-        allow_patterns=f"{MODEL_SUBFOLDER}/**" # Pattern to grab all files in the subfolder
-    )
-    print(f"✅ Model files downloaded to: {local_model_path}")
+    # Download the config and vocab from the BASE model folder
+    config_path = hf_hub_download(repo_id=REPO_ID, filename="F5TTS_v1_Base/config.json")
+    vocab_path = hf_hub_download(repo_id=REPO_ID, filename="F5TTS_v1_Base/vocab.txt")
 
-    # --- Load the model from the local path ---
-    print("Loading model from local path...")
-    processor = AutoProcessor.from_pretrained(local_model_path, trust_remote_code=True)
-    model = VitsModel.from_pretrained(local_model_path, trust_remote_code=True).to(DEVICE)
-    print("✅ TTS model and processor loaded successfully.")
+    # Download the fine-tuned model weights from the V2 folder
+    model_path = hf_hub_download(repo_id=REPO_ID, filename="F5TTS_v1_Base_v2/model_last.pt")
+    
+    # The downloaded files are just paths, we need to move the vocab file
+    # to where the code expects it (inside the text folder)
+    # This is a quirk of how this specific repo is structured.
+    f5_tts_text_dir = os.path.join('f5-tts', 'text')
+    expected_vocab_path = os.path.join(f5_tts_text_dir, 'vocab.txt')
+    if not os.path.exists(expected_vocab_path):
+        import shutil
+        shutil.copy(vocab_path, expected_vocab_path)
+        print(f"Copied vocab.txt to {expected_vocab_path}")
+
+    print("✅ All necessary files downloaded.")
 
 except Exception as e:
-    print(f"❌ An error occurred during model loading: {e}")
-    processor = None
-    model = None
+    print(f"❌ Failed to download files: {e}")
+    config_path, model_path = None, None
+
+# --- Load the model using the custom code from the repo ---
+net_g = None
+if config_path and model_path:
+    print("Loading model using custom f5-tts code...")
+    try:
+        hps = utils.get_hparams_from_file(config_path)
+        
+        net_g = SynthesizerTrn(
+            len(hps.symbols),
+            hps.data.filter_length // 2 + 1,
+            hps.train.segment_size // hps.data.hop_length,
+            **hps.model
+        ).to(DEVICE)
+        
+        _ = net_g.eval()
+        _ = utils.load_checkpoint(model_path, net_g, None)
+        
+        print("✅ Fine-tuned model loaded successfully!")
+
+    except Exception as e:
+        print(f"❌ Error loading model with custom code: {e}")
+else:
+    print("Skipping model loading due to download failure.")
 
 
 # --- 2. Helper Function for Stress Format Conversion ---
-
 def convert_ruaccent_to_plus(text_with_apostrophe: str) -> str:
     vowels = "аеёиоуыэюяАЕЁИОУЫЭЮЯ"
     words = text_with_apostrophe.split(' ')
@@ -62,10 +95,9 @@ def convert_ruaccent_to_plus(text_with_apostrophe: str) -> str:
     return ' '.join(processed_words)
 
 # --- 3. FastAPI Service Setup ---
-
 app = FastAPI(
-    title="Russian TTS Service",
-    description="A service for Russian Text-to-Speech using F5-TTS and RuAccent.",
+    title="F5-TTS Russian Inference Service",
+    description="Runs the fine-tuned Misha24-10/F5-TTS_RUSSIAN model.",
 )
 
 class TTSRequest(BaseModel):
@@ -73,34 +105,37 @@ class TTSRequest(BaseModel):
 
 class TTSResponse(BaseModel):
     audio_base64: str
-    text_processed: str
 
 @app.on_event("startup")
 async def startup_event():
-    if not all([processor, model]):
-        raise RuntimeError("TTS Model did not load correctly. Please check logs for errors.")
+    if not net_g:
+        raise RuntimeError("TTS Model did not load correctly. Please check logs.")
     print("✅ Application startup successful. Service is ready.")
-
 
 @app.post("/synthesize", response_model=TTSResponse, summary="Synthesize Russian Speech")
 async def synthesize_speech(request: TTSRequest):
     try:
         stressed_text_apostrophe = ruaccent.process_all(request.text)
         final_text = convert_ruaccent_to_plus(stressed_text_apostrophe)
-        inputs = processor(text=final_text, return_tensors="pt").to(DEVICE)
-
+        
+        # Use the repo's text_to_sequence function
+        stn_tst = text_to_sequence(final_text, hps.symbols, hps.data.text_cleaners)
+        
         with torch.no_grad():
-            output = model(**inputs).waveform
+            x_tst = torch.LongTensor(stn_tst).to(DEVICE).unsqueeze(0)
+            x_tst_lengths = torch.LongTensor([len(stn_tst)]).to(DEVICE)
+            
+            # Perform inference
+            audio = net_g.infer(x_tst, x_tst_lengths, noise_scale=.667, noise_scale_w=0.8, length_scale=1.0)[0][0,0].data.cpu().float().numpy()
 
-        waveform = output.squeeze().cpu().numpy()
-
+        # Save to an in-memory WAV file
         buffer = io.BytesIO()
-        sf.write(buffer, waveform, SAMPLING_RATE, format='WAV')
+        sf.write(buffer, audio, hps.data.sampling_rate, format='WAV')
         buffer.seek(0)
-
+        
         audio_base64 = base64.b64encode(buffer.read()).decode('utf-8')
-
-        return TTSResponse(audio_base64=audio_base64, text_processed=final_text)
+        
+        return TTSResponse(audio_base64=audio_base64)
 
     except Exception as e:
         print(f"An error occurred during synthesis: {e}")
